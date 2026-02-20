@@ -64,3 +64,7 @@ local-data/
 # docker volumes mount
 /docker-volumes
 docker-volumes/
+logs_llm/*
+rag_storage/*
+.code-graph-rag/*
+.beads/*

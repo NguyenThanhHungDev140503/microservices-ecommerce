@@ -1,0 +1,689 @@
+=== CODE-GRAPH RAG SESSION LOG ===
+
+USER: Tìm code checkout/payment
+ASSISTANT: Dựa trên việc tìm kiếm codebase, tôi đã tìm thấy **code checkout** nhưng **không có payment gateway**. Đây là hệ thống **checkout-only** (chỉ tạo đơn hàng, không xử lý thanh toán).
+
+## 📋 Code Checkout
+
+### 1. **Frontend - React Store** (`src/Apps/App.Store`)
+
+**Checkout UI Component**:
+- `src/Apps/App.Store/src/pages/Checkout.jsx` - Trang checkout chính
+- `src/Apps/App.Store/src/components/checkout/CheckoutSection.jsx` - Form checkout
+- `src/Apps/App.Store/src/services/basketService.js` - API service
+
+**CheckoutSection.jsx** - Chức năng chính:
+```javascript
+// API call để checkout basket
+const handleSubmit = async (values, { setSubmitting }) => {
+  const checkoutData = {
+    customer: {
+      name: `${values.firstName} ${values.lastName}`,
+      email: values.email,
+      phoneNumber: values.phoneNumber,
+    },
+    shippingAddress: {
+      addressLine: values.addressLine,
+      subdivision: values.subdivision,
+      city: values.city,
+      stateOrProvince: values.stateOrProvince,
+      country: values.country,
+      postalCode: values.postalCode,
+    },
+    couponCode: couponApplied && couponData ? couponData.couponCode : null,
+  };
+
+  const response = await basketService.checkoutBasket(checkoutData);
+  // Hiển thị modal thành công với order number
+};
+```
+
+### 2. **Backend - Basket Service** (`src/Services/Basket`)
+
+**API Endpoint**:
+- `src/Services/Basket/Api/Basket.Api/Endpoints/BasketCheckout.cs` - REST API endpoint
+- `POST /basket/checkout`
+
+**Command Handler**:
+- `src/Services/Basket/Core/Basket.Application/Features/Basket/Commands/BasketCheckoutCommand.cs`
+
+**Quy trình xử lý**:
+1. Validate customer info & shipping address
+2. Kiểm tra basket có items
+3. Áp dụng coupon code (nếu có)
+4. Publish `BasketCheckoutDomainEvent`
+5. Xóa basket sau khi checkout
+6. Push integration event vào outbox
+
+### 3. **Backend - Order Service** (`src/Services/Order`)
+
+**Consumer** xử lý event từ Basket:
+- `src/Services/Order/Worker/Order.Worker.Consumer/EventHandlers/Integrations/BasketCheckoutIntegrationEventHandler.cs`
+
+**Quy trình**:
+1. Nhận `BasketCheckoutIntegrationEvent` từ RabbitMQ
+2. Check idempotency (tránh xử lý trùng lặp)
+3. Tạo order với `CreateOrderCommand`
+4. Lưu vào database (SQL Server)
+
+**Order Entity**:
+- `src/Services/Order/Core/Order.Domain/Entities/OrderEntity.cs`
+- Status: Pending → Confirmed → Processing → Shipped → Delivered
+- Hỗ trợ Cancel và Refund
+
+## 🔍 **KHÔNG CÓ PAYMENT GATEWAY**
+
+Sau khi kiểm tra toàn bộ codebase:
+- **Không có service Payment**
+- **Không có integration với Stripe, PayPal, VNPay, Momo**
+- **Không có payment processing logic**
+
+File `CheckoutSection.jsx` có đoạn comment về payment nhưng bị disable:
+```javascript
+{/* <h4 className="fz-checkout-title">{t('checkout.paymentInformation')}</h4>
+<div className="d-flex payment-area align-items-center">
+  <input
+    type="text"
+    name="payment-option"
+    id="checkout-payment-option"
+    placeholder="xxxx xxxx xxxx xxxx"
+  />
+  <i className="fa-light fa-credit-card"></i>
+</div> */}
+```
+
+## 📊 **Quy trình Checkout hiện tại**:
+
+```
+User填写表单 
+    ↓
+Frontend: POST /basket/checkout
+    ↓
+Basket Service: Validate & Publish Event
+    ↓
+RabbitMQ: BasketCheckoutIntegrationEvent
+    ↓
+Order Service Consumer: Tạo Order
+    ↓
+Database: Lưu Order (status: Pending)
+    ↓
+Frontend: Hiển thị Order Success Modal với Order No
+```
+
+## 💡 **Để thêm payment, bạn cần**:
+
+1. Tạo **Payment Service** mới
+2. Tích hợp payment gateway (Stripe/VNPay/Momo)
+3. Thêm step processing payment sau khi tạo order
+4. Update order status dựa trên payment result
+5. Implement **Saga Pattern** để xử lý rollback khi payment thất bại
+
+**Microservices hiện có**: Catalog, Basket, Order, Inventory, Discount, Notification, Search, Report, Communication
+**Thiếu**: Payment Service
+USER: Phân tích authentication system trong dự án này
+ASSISTANT: # 🔐 Phân tích Authentication System trong ProG Coder Shop
+
+## 📋 Tổng quan
+
+Dự án sử dụng **Keycloak** làm Identity Provider với giao thức **OpenID Connect (OIDC)** và **JWT tokens**. Đây là giải pháp SSO (Single Sign-On) enterprise-grade hỗ trợ đa tenant, role-based access control.
+
+---
+
+## 🏗️ Kiến trúc Authentication
+
+```
+┌─────────────────┐     OIDC      ┌──────────────┐     JWT Bearer     ┌─────────────────┐
+│   React Frontend│  ◄────────►  │   Keycloak   │   ◄─────────────► │  Backend APIs   │
+│  (Keycloak-js)  │              │              │                    │  (.NET 8)       │
+└─────────────────┘              └──────────────┘                    └─────────────────┘
+       │                                  │                                      │
+       │                                  │                                      │
+       ▼                                  ▼                                      ▼
+  Token Store                         JWT Issuer                         Token Validation
+  (Cookie)                         (Access Token)                    (JwtBearer Auth)
+```
+
+---
+
+## 🔑 Chi tiết từng thành phần
+
+### 1. **Keycloak Configuration** 
+
+**Realm**: `prog-coder-realm`  
+**Client ID**: `prog-coder-client-id`  
+**Authority URL**: `http://localhost:8080/realms/prog-coder-realm`  
+**Redirect URI**: `http://localhost:3002/` (App.Store)
+
+**Docker Compose Setup** (`docker-compose.yml`):
+```yaml
+keycloak:
+  image: quay.io/keycloak/keycloak:23.0.6
+  environment:
+    KEYCLOAK_ADMIN: admin
+    KEYCLOAK_ADMIN_PASSWORD: 123456789Aa
+    KC_DB: postgres
+    KC_DB_URL: jdbc:postgresql://postgres-sql/keycloak_db
+    KC_HTTP_ENABLED: true
+    KC_HOSTNAME_STRICT_HTTPS: false
+```
+
+---
+
+### 2. **Frontend Authentication** (`src/Apps/App.Store`)
+
+#### **Keycloak-js Integration**
+
+**File**: `src/Apps/App.Store/src/services/keycloakService.js`
+
+**Khởi tạo Keycloak**:
+```javascript
+const keycloakInstance = new Keycloak({
+  url: import.meta.env.VITE_KEYCLOAK_URL,      // http://localhost:8080
+  realm: import.meta.env.VITE_KEYCLOAK_REALM,  // prog-coder-realm
+  clientId: import.meta.env.VITE_KEYCLOAK_CLIENT_ID  // prog-coder-client-id
+});
+
+// Initialize with PKCE (Proof Key for Code Exchange)
+await initKeycloak({
+  onLoad: 'check-sso',
+  checkLoginIframe: false,
+  pkceMethod: 'S256',
+  redirectUri: window.location.origin
+});
+```
+
+**Quy trình Login**:
+```javascript
+// Redirect to Keycloak login page
+keycloak.login({ redirectUri });
+
+// Keycloak redirects back with: ?code=xxx&session_state=xxx
+// Keycloak-js handles the callback and exchanges code for tokens
+```
+
+**Token Management**:
+```javascript
+// Token được lưu vào cookie (không localStorage để tránh XSS)
+setCookie('access_token', keycloak.token, 1);
+
+// Auto refresh token trước khi expired (60s)
+setInterval(() => {
+  keycloak.updateToken(30); // Refresh nếu token hết hạn trong 30s
+}, 60000);
+```
+
+#### **KeycloakContext Provider**
+
+**File**: `src/Apps/App.Store/src/contexts/KeycloakContext.jsx`
+
+**Cung cấp cho toàn bộ app**:
+```javascript
+const { authenticated, login, logout, getUserInfo, updateToken } = useKeycloak();
+
+// User info được extract từ JWT token
+const userInfo = {
+  id: tokenParsed.sub,
+  username: tokenParsed.preferred_username,
+  email: tokenParsed.email,
+  firstName: tokenParsed.given_name,
+  lastName: tokenParsed.family_name,
+  roles: tokenParsed.realm_access?.roles
+};
+```
+
+#### **Protected Route**
+
+**File**: `src/Apps/App.Store/src/components/auth/ProtectedRoute.jsx`
+
+```javascript
+const ProtectedRoute = ({ children }) => {
+  const { authenticated, login, keycloakReady } = useKeycloak();
+  
+  // Tự động redirect về Keycloak nếu chưa login
+  if (keycloakReady && !authenticated) {
+    login({ redirectUri: window.location.origin });
+  }
+  
+  return authenticated ? children : <div>Loading...</div>;
+};
+```
+
+#### **API Interceptor** 
+
+**File**: `src/Apps/App.Store/src/api/axiosInstance.js`
+
+**Tự động gắn JWT token vào tất cả requests**:
+```javascript
+// Request interceptor
+axiosInstance.interceptors.request.use((config) => {
+  const token = getCookie('access_token');
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Response interceptor - handle 401
+axiosInstance.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response?.status === 401) {
+      // Xóa cookie, redirect về login
+      document.cookie = "access_token=; expires=...";
+    }
+    return Promise.reject(error);
+  }
+);
+```
+
+---
+
+### 3. **Backend Authentication** (`src/Services/...`)
+
+#### **JWT Bearer Authentication Configuration**
+
+**File**: `src/Shared/BuildingBlocks/Authentication/Extensions/AuthorizationExtension.cs`
+
+```csharp
+public static IServiceCollection AddAuthenticationAndAuthorization(
+    this IServiceCollection services,
+    IConfiguration cfg)
+{
+    var authority = cfg["Authentication:Authority"];  // http://keycloak:8080/realms/prog-coder-realm
+    var audience = cfg["Authentication:Audience"];    // "account"
+    
+    services.AddAuthentication(options =>
+    {
+        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer(options =>
+    {
+        options.Authority = authority;
+        options.Audience = audience;
+        options.RequireHttpsMetadata = false; // Development mode
+        
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = false,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            ClockSkew = TimeSpan.FromSeconds(60),
+            NameClaimType = JwtRegisteredClaimNames.Sub,
+            RoleClaimType = ClaimTypes.Role
+        };
+        
+        // Custom event handler để extract roles từ realm_access claim
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = ctx =>
+            {
+                var realmAccess = ctx.Principal!.FindFirst("realm_access")?.Value;
+                using var doc = JsonDocument.Parse(realmAccess);
+                var roles = doc.RootElement.GetProperty("roles");
+                
+                foreach (var r in roles.EnumerateArray())
+                {
+                    var role = r.GetString();
+                    ctx.Principal!.Identities.First()
+                        .AddClaim(new Claim(ClaimTypes.Role, role));
+                }
+                return Task.CompletedTask;
+            }
+        };
+    });
+    
+    services.AddAuthorization();
+    return services;
+}
+```
+
+#### **User Context Extension**
+
+**File**: `src/Shared/BuildingBlocks/Authentication/Extensions/UserContextExtension.cs`
+
+**Extract user information từ Claims**:
+```csharp
+public static class UserContextExtension
+{
+    public static UserContext GetCurrentUser(this IHttpContextAccessor context)
+    {
+        var identity = context.HttpContext?.User;
+        
+        return new UserContext()
+        {
+            Id = identity?.FindFirst(ClaimTypes.NameIdentifier)?.Value,
+            Email = identity?.FindFirst(ClaimTypes.Email)?.Value,
+            UserName = identity?.FindFirst("preferred_username")?.Value,
+            FirstName = identity?.FindFirst(ClaimTypes.GivenName)?.Value,
+            LastName = identity?.FindFirst(ClaimTypes.Surname)?.Value,
+            Tenant = identity?.FindFirst("tenant")?.Value,
+            Roles = identity?.FindAll(ClaimTypes.Role).Select(c => c.Value).ToList(),
+            EmailVerified = bool.Parse(identity?.FindFirst("email_verified")?.Value)
+        };
+    }
+}
+```
+
+#### **Custom Claim Types**
+
+**File**: `src/Shared/Common/Constants/CustomClaimTypes.cs`
+
+```csharp
+public sealed class CustomClaimTypes
+{
+    public const string RealmAccess = "realm_access";
+    public const string Roles = "roles";
+    public const string UserName = "preferred_username";
+    public const string EmailVerified = "email_verified";
+    public const string Tenant = "tenant";
+}
+```
+
+#### **Protected API Endpoints**
+
+**Ví dụ**: Order Service - Create Order
+
+**File**: `src/Services/Order/Api/Order.Api/Endpoints/CreateOrder.cs`
+
+```csharp
+public sealed class CreateOrder : ICarterModule
+{
+    public void AddRoutes(IEndpointRouteBuilder app)
+    {
+        app.MapPost(ApiRoutes.Order.Create, HandleCreateOrderAsync)
+            .RequireAuthorization(); // ✅ Requires authentication
+            // .RequireAuthorization("AdminPolicy"); // ✅ Requires specific role
+    }
+    
+    private async Task<ApiCreatedResponse<Guid>> HandleCreateOrderAsync(
+        ISender sender,
+        IHttpContextAccessor httpContext,
+        [FromBody] CreateOrUpdateOrderDto dto)
+    {
+        // ✅ Get current user from JWT claims
+        var currentUser = httpContext.GetCurrentUser();
+        var command = new CreateOrderCommand(
+            dto, 
+            Actor.User(currentUser.Email));
+        
+        return await sender.Send(command);
+    }
+}
+```
+
+---
+
+### 4. **Service-to-Service Authentication** 
+
+#### **Client Credentials Flow**
+
+**File**: `src/Services/Inventory/Core/Inventory.Infrastructure/ApiClients/IKeycloakApi.cs`
+
+```csharp
+public interface IKeycloakApi
+{
+    [Post("/realms/{realm}/protocol/openid-connect/token")]
+    [Headers("Content-Type: application/x-www-form-urlencoded")]
+    Task<KeycloakAccessTokenResponse> GetAccessTokenAsync(
+        [AliasAs("realm")] string realm,
+        [Body(BodySerializationMethod.UrlEncoded)] 
+        Dictionary<string, string> form);
+}
+```
+
+**File**: `src/Services/Inventory/Core/Inventory.Infrastructure/Services/CatalogApiService.cs`
+
+```csharp
+public sealed class CatalogApiService
+{
+    private async Task<KeycloakAccessTokenResponse> GetAccessTokenAsync()
+    {
+        var form = new Dictionary<string, string>
+        {
+            { "client_id", _clientId },           // prog-coder-service-account
+            { "client_secret", _clientSecret },
+            { "grant_type", "client_credentials" },
+            { "scope", "openid" }
+        };
+        
+        return await _keycloakApi.GetAccessTokenAsync(_realm, form);
+    }
+    
+    public async Task<ApiGetResponse<GetProductByIdReponse>?> GetProductByIdAsync(
+        string productId)
+    {
+        var tokenResponse = await GetAccessTokenAsync();
+        var response = await _catalogApi.GetProductByIdAsync(
+            productId, 
+            $"Bearer {tokenResponse.AccessToken}");
+        return response;
+    }
+}
+```
+
+---
+
+### 5. **Swagger UI OAuth2 Integration**
+
+**File**: `src/Shared/BuildingBlocks/Swagger/Extensions/SwaggerGenExtension.cs`
+
+```csharp
+services.AddSwaggerGen(opts =>
+{
+    // OAuth2 security definition
+    opts.AddSecurityDefinition("oauth2", new OpenApiSecurityScheme
+    {
+        Type = SecuritySchemeType.OAuth2,
+        Flows = new OpenApiOAuthFlows
+        {
+            AuthorizationCode = new OpenApiOAuthFlow
+            {
+                AuthorizationUrl = new Uri($"{authority}/protocol/openid-connect/auth"),
+                TokenUrl = new Uri($"{authority}/protocol/openid-connect/token"),
+                Scopes = oauthScopes
+            }
+        }
+    });
+    
+    // Auto-add security requirements to [Authorize] endpoints
+    opts.OperationFilter<AuthorizeCheckOperationFilter>();
+});
+
+// Swagger UI with OAuth2
+app.UseSwaggerUI(c =>
+{
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "v1");
+    c.OAuthClientId(clientId);
+    c.OAuthClientSecret(clientSecret);
+    c.OAuthScopes(scopes);
+    c.OAuth2RedirectUrl(oAuth2RedirectUrl);
+});
+```
+
+**File**: `src/Shared/BuildingBlocks/Swagger/AuthorizeCheckOperationFilter.cs`
+
+```csharp
+public sealed class AuthorizeCheckOperationFilter : IOperationFilter
+{
+    public void Apply(OpenApiOperation operation, OperationFilterContext context)
+    {
+        var hasAuthorize = context.ApiDescription
+            .ActionDescriptor
+            .EndpointMetadata
+            .OfType<IAuthorizeData>()
+            .Any();
+        
+        if (!hasAuthorize) return;
+        
+        operation.Responses.TryAdd("401", new OpenApiResponse { Description = "Unauthorized" });
+        operation.Responses.TryAdd("403", new OpenApiResponse { Description = "Forbidden" });
+        
+        operation.Security = new List<OpenApiSecurityRequirement>
+        {
+            new OpenApiSecurityRequirement
+            {
+                [new OpenApiSecurityScheme {
+                    Reference = new OpenApiReference {
+                        Type = ReferenceType.SecurityScheme,
+                        Id = "oauth2"
+                    }
+                }] = new[] { "openid" }
+            }
+        };
+    }
+}
+```
+
+---
+
+## 🔄 Quy trình Authentication Flow
+
+### **User Login Flow**
+
+```
+1. User truy cập trang protected (ví dụ: /checkout)
+   ↓
+2. ProtectedRoute component kiểm tra authenticated = false
+   ↓
+3. Redirect user về Keycloak: 
+   http://localhost:8080/realms/prog-coder-realm/protocol/openid-connect/auth?
+     client_id=prog-coder-client-id&
+     redirect_uri=http://localhost:3002/&
+     response_type=code&
+     scope=openid&
+     code_challenge=xxx (PKCE)
+   ↓
+4. User nhập username/password trên Keycloak login page
+   ↓
+5. Keycloak redirect về frontend với: ?code=xxx&session_state=xxx
+   ↓
+6. Keycloak-js tự động exchange code → access_token + refresh_token
+   ↓
+7. Access token được lưu vào cookie: access_token=xxx
+   ↓
+8. KeycloakContext set authenticated = true
+   ↓
+9. User được redirect về trang yêu cầu
+```
+
+### **API Request Flow**
+
+```
+1. Frontend gọi API (ví dụ: POST /basket/checkout)
+   ↓
+2. Axios interceptor tự động gán header:
+   Authorization: Bearer <access_token>
+   ↓
+3. API Gateway forwards request → Basket Service
+   ↓
+4. JwtBearerMiddleware validates token:
+   - Kiểm tra signature với Keycloak public key
+   - Validate issuer, audience, expiration
+   - Extract claims → HttpContext.User
+   ↓
+5. Nếu valid → tiếp tục xử lý
+   Nếu invalid → return 401 Unauthorized
+```
+
+---
+
+## 🔐 Security Features
+
+| Feature | Implementation |
+|---------|----------------|
+| **Token Validation** | JWT signature validation với Keycloak public key |
+| **Token Refresh** | Auto-refresh trước khi expired (30s buffer) |
+| **PKCE** | Proof Key for Code Exchange để prevent auth code interception |
+| **HTTPS Required** | `RequireHttpsMetadata = false` (dev), `true` (prod) |
+| **Cookie Security** | `SameSite=Lax`, `Secure` flag trong HTTPS |
+| **Token Storage** | Cookie (không localStorage để tránh XSS) |
+| **Authorization** | Role-based với `[RequireAuthorization("RoleName")]` |
+| **Token Expiration Handling** | Auto logout khi refresh token thất bại |
+| **Idempotency** | Check duplicate token processing với Inbox Pattern |
+| **Service-to-Service** | Client Credentials flow với separate client ID |
+
+---
+
+## 📊 JWT Token Structure
+
+**Example Access Token (decoded)**:
+```json
+{
+  "sub": "550e8400-e29b-41d4-a716-446655440000",
+  "preferred_username": "user@example.com",
+  "email": "user@example.com",
+  "given_name": "John",
+  "family_name": "Doe",
+  "email_verified": true,
+  "realm_access": {
+    "roles": ["user", "customer"]
+  },
+  "tenant": "tenant-1",
+  "iss": "http://localhost:8080/realms/prog-coder-realm",
+  "aud": "account",
+  "exp": 1704067200,
+  "iat": 1704063600
+}
+```
+
+**Claims Mapping**:
+- `sub` → `ClaimTypes.NameIdentifier` (User ID)
+- `preferred_username` → CustomClaimTypes.UserName
+- `given_name` → `ClaimTypes.GivenName`
+- `family_name` → `ClaimTypes.Surname`
+- `email` → `ClaimTypes.Email`
+- `realm_access.roles` → `ClaimTypes.Role[]`
+
+---
+
+## 🎯 Best Practices Được Áp Dụng
+
+1. ✅ **PKCE** - Prevent authorization code interception
+2. ✅ **Short-lived Access Tokens** - Giảm thiểu impact nếu token bị leak
+3. ✅ **Refresh Token Rotation** - Enhance security
+4. ✅ **Cookie over localStorage** - Avoid XSS attacks
+5. ✅ **Automatic Token Refresh** - Seamless user experience
+6. ✅ **Centralized Token Validation** - JwtBearerMiddleware
+7. ✅ **Role-based Authorization** - `[RequireAuthorization]`
+8. ✅ **Swagger OAuth2 Integration** - Easy API testing
+9. ✅ **Service-to-Service Auth** - Client Credentials flow
+10. ✅ **Tenant Support** - Multi-tenant architecture
+
+---
+
+## 🚀 Cấu hình trong Production
+
+**Các tham số cần thay đổi**:
+
+```json
+// appsettings.json
+{
+  "Authentication": {
+    "Authority": "https://auth.yourdomain.com/realms/prog-coder-realm",
+    "RequireHttpsMetadata": true,  // ✅ Bắt buộc trong production
+    "ClientId": "prod-client-id",
+    "ClientSecret": "strong-secret-key"
+  }
+}
+
+// .env
+VITE_KEYCLOAK_URL=https://auth.yourdomain.com
+VITE_KEYCLOAK_REDIRECT_URI=https://store.yourdomain.com/
+```
+
+---
+
+## 📝 Kết luận
+
+Authentication system trong dự án này là một giải pháp **production-ready** với:
+
+- **Keycloak** làm Identity Provider (enterprise-grade)
+- **OIDC + JWT** với PKCE cho frontend authentication
+- **Role-based authorization** với multi-tenant support
+- **Automatic token refresh** với seamless user experience
+- **Service-to-service authentication** với Client Credentials flow
+- **Swagger UI OAuth2** cho dễ dàng testing
+- **Security best practices** được áp dụng đầy đủ
+
+Đây là một kiến trúc authentication **mạnh mẽ, scalable và secure** phù hợp cho microservices architecture.
